@@ -47,6 +47,11 @@ type Encoder struct {
 	// resolution for delta timing
 	TicksPerQuarterNote uint16
 
+	// Division is the raw division word written to the header. When it is
+	// zero, TicksPerQuarterNote is written instead. Set it to keep a SMPTE
+	// time-base (high bit set) intact.
+	Division uint16
+
 	TimeFormat timeFormat
 	Tracks     []*Track
 }
@@ -54,6 +59,16 @@ type Encoder struct {
 // NewEncoder returns an encoder with the specified format
 func NewEncoder(w io.WriteSeeker, format uint16, ppqn uint16) *Encoder {
 	return &Encoder{w: w, Format: format, TicksPerQuarterNote: ppqn}
+}
+
+// NewEncoderFromDecoder returns an encoder pre-configured with the format and
+// division of the passed decoder, so a decoded file can be written back with
+// the same header values.
+func NewEncoderFromDecoder(w io.WriteSeeker, d *Decoder) *Encoder {
+	e := NewEncoder(w, d.Format, d.TicksPerQuarterNote)
+	e.Division = d.Division
+	e.Tracks = d.Tracks
+	return e
 }
 
 // NewTrack adds and return a new track (not thread safe)
@@ -97,14 +112,21 @@ func (e *Encoder) writeHeaders() error {
 	if err := binary.Write(e.w, binary.BigEndian, uint16(len(e.Tracks))); err != nil {
 		return err
 	}
-	// division [uint16] <-- contains precision
-	if err := binary.Write(e.w, binary.BigEndian, e.TicksPerQuarterNote); err != nil {
+	// division [uint16] <-- contains precision, or the raw SMPTE time-base
+	division := e.Division
+	if division == 0 {
+		division = e.TicksPerQuarterNote
+	}
+	if err := binary.Write(e.w, binary.BigEndian, division); err != nil {
 		return err
 	}
 	return nil
 }
 
 func (e *Encoder) encodeTrack(t *Track) error {
+	if t == nil {
+		return nil
+	}
 	// chunk id [4]
 	if _, err := e.w.Write(trackChunkID[:]); err != nil {
 		return err

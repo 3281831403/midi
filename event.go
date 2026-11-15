@@ -3,9 +3,7 @@ package midi
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"log"
 )
 
 // NoteOn returns a pointer to a new event of type NoteOn (without the delta timing data)
@@ -68,14 +66,16 @@ func ControlChange(channel, controller, newVal int) *Event {
 	}
 }
 
-// ProgramChange sets a new value the same way as ControlChange
-// but implements Mode control and special message by using reserved controller numbers 120-127.
+// ProgramChange returns a program change event for the given channel and
+// program number. A program change carries a single data byte, so the
+// controller argument is kept for API compatibility and ignored.
 func ProgramChange(channel, controller, newVal int) *Event {
 	return &Event{
 		MsgChan:    uint8(channel),
 		MsgType:    uint8(EventByteMap["ProgramChange"]),
 		Controller: uint8(controller),
 		NewValue:   uint8(newVal),
+		NewProgram: uint8(newVal),
 	}
 }
 
@@ -179,6 +179,13 @@ type Event struct {
 	Scale uint32 // 0 or 1
 	//
 	SmpteOffset *SmpteOffset
+	// SysExType is 0xF0 or 0xF7 for system exclusive events, 0 otherwise.
+	SysExType uint8
+	// RawData holds the payload of a meta or sysex event exactly as it was
+	// read. When it is set (even to an empty slice), Encode writes it out
+	// unchanged, which keeps unknown/unsupported meta events and sysex data
+	// intact through a read/write round trip.
+	RawData []byte
 }
 
 // Copy returns an exact copy of the event
@@ -210,6 +217,10 @@ func (e *Event) Copy() *Event {
 		Bpm:            e.Bpm,
 		Key:            e.Key,
 		Scale:          e.Scale,
+		SysExType:      e.SysExType,
+	}
+	if e.RawData != nil {
+		newEv.RawData = append([]byte(nil), e.RawData...)
 	}
 	if e.TimeSignature != nil {
 		newEv.TimeSignature = &TimeSignature{
@@ -269,198 +280,170 @@ func (e *Event) String() string {
 }
 
 // Encode converts an Event into a slice of bytes ready to be written to a file.
+//
+// Events are always written with a complete status byte (running status is
+// never used) and with the shortest possible variable-length quantities. Meta
+// and sysex payloads are written exactly as stored in RawData when it is set.
 func (e *Event) Encode() ([]byte, error) {
+	if e == nil {
+		return nil, fmt.Errorf("can't encode a nil event: %w", ErrUnexpectedData)
+	}
 	buff := bytes.NewBuffer(nil)
-	if _, err := buff.Write(EncodeVarint(e.TimeDelta)); err != nil {
-		return buff.Bytes(), err
+	delta, err := encodeDelta(e.TimeDelta)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := buff.Write(delta); err != nil {
+		return nil, err
 	}
 
-	// msg type and chan are stored together
-	msgData := []byte{(e.MsgType << 4) | e.MsgChan}
-	if e.MsgType == EventByteMap["Meta"] {
-		msgData = []byte{0xFF}
+	switch {
+	case e.SysExType == 0xF0 || e.SysExType == 0xF7:
+		return e.encodeSysEx(buff)
+	case e.MsgType == EventByteMap["Meta"]:
+		return e.encodeMeta(buff)
 	}
-	if _, err := buff.Write(msgData); err != nil {
-		return buff.Bytes(), err
+
+	// Voice messages: msg type and channel are stored together.
+	if _, err := buff.Write([]byte{(e.MsgType << 4) | (e.MsgChan & 0x0F)}); err != nil {
+		return nil, err
 	}
 	switch e.MsgType {
-	// unknown but found in the wild (seems to come with 1 data bytes)
-	case 0x2, 0x3, 0x4, 0x5, 0x6:
-		buff.Write([]byte{0x0})
-	// Note Off/On
+	// Note Off, Note On, Polyphonic Key Pressure
 	case 0x8, 0x9, 0xA:
-		// note
-		if err := binary.Write(buff, binary.BigEndian, e.Note); err != nil {
-			return buff.Bytes(), err
-		}
-		// velocity
-		if err := binary.Write(buff, binary.BigEndian, e.Velocity); err != nil {
-			return buff.Bytes(), err
-		}
-		// Control Change / Channel Mode
-		// This message is sent when a controller value changes.
-		// Controllers include devices such as pedals and levers.
-		// Controller numbers 120-127 are reserved as "Channel Mode Messages".
-		// The controller number is between 0-119.
-		// The new controller value is between 0-127.
+		buff.Write([]byte{e.Note & 0x7F, e.Velocity & 0x7F})
+	// Control Change / Channel Mode
 	case 0xB:
-		if err := binary.Write(buff, binary.BigEndian, e.Controller); err != nil {
-			return buff.Bytes(), err
-		}
-		if err := binary.Write(buff, binary.BigEndian, e.NewValue); err != nil {
-			return buff.Bytes(), err
-		}
-		/*
-			channel mode messages
-			Documented, not technically exposed
-
-			This the same code as the Control Change, but implements Mode control and
-			special message by using reserved controller numbers 120-127. The commands are:
-
-			All Sound Off
-			c = 120, v = 0
-			When All Sound Off is received all oscillators will turn off,
-			and their volume envelopes are set to zero as soon as possible.
-
-			Reset All Controllers
-			c = 121, v = x
-			When Reset All Controllers is received, all controller values are reset to their default values.
-			Value must only be zero unless otherwise allowed in a specific Recommended Practice.
-
-			Local Control.
-			c = 122, v = 0: Local Control Off
-			c = 122, v = 127: Local Control On
-			When Local Control is Off, all devices on a given channel will respond only to data received over MIDI.
-			Played data, etc. will be ignored. Local Control On restores the functions of the normal controllers.
-
-			All Notes Off.
-			c = 123, v = 0: All Notes Off (See text for description of actual mode commands.)
-			c = 124, v = 0: Omni Mode Off
-			c = 125, v = 0: Omni Mode On
-			c = 126, v = M: Mono Mode On (Poly Off) where M is the number of channels (Omni Off) or 0 (Omni On)
-			c = 127, v = 0: Poly Mode On (Mono Off) (Note: These four messages also cause All Notes Off)
-			When an All Notes Off is received, all oscillators will turn off.
-			Program Change
-					This message sent when the patch number changes. Value is the new program number.
-		*/
+		buff.Write([]byte{e.Controller & 0x7F, e.NewValue & 0x7F})
+	// Program Change: a single data byte.
 	case 0xC:
-		if err := binary.Write(buff, binary.BigEndian, e.NewProgram); err != nil {
-			return buff.Bytes(), err
-		}
-		if err := binary.Write(buff, binary.BigEndian, e.NewValue); err != nil {
-			return buff.Bytes(), err
-		}
-		// Channel Pressure (Aftertouch)
-		// This message is most often sent by pressing down on the key after it "bottoms out".
-		// This message is different from polyphonic after-touch.
-		// Use this message to send the single greatest pressure value (of all the current depressed keys).
-		// Value is the pressure value.
-		// Most MIDI controllers don't generate Polyphonic Key AfterTouch because that requires a pressure sensor for each individual key
-		// on a MIDI keyboard, and this is an expensive feature to implement.
-		// For this reason, many cheaper units implement Channel Pressure instead of Aftertouch, as the former only requires
-		// one sensor for the entire keyboard's pressure.
+		buff.Write([]byte{e.NewProgram & 0x7F})
+	// Channel Pressure (Aftertouch)
 	case 0xD:
-		if err := binary.Write(buff, binary.BigEndian, e.Pressure); err != nil {
-			return buff.Bytes(), err
-		}
-		// Pitch Bend Change.
-		// This message is sent to indicate a change in the pitch bender (wheel or lever, typically).
-		// The pitch bender is measured by a fourteen bit value. Center (no pitch change) is 2000H.
-		// Sensitivity is a function of the transmitter.
-		// Last 7 bits of the first byte are the least significant 7 bits.
-		// Last 7 bits of the second byte are the most significant 7 bits.
+		buff.Write([]byte{e.Pressure & 0x7F})
+	// Pitch Bend Change: LSB then MSB.
 	case 0xE:
-		// pitchbend
-		lsb := byte(e.AbsPitchBend & 0x7F)
-		msb := byte((e.AbsPitchBend & (0x7F << 7)) >> 7)
-		if err := binary.Write(buff, binary.BigEndian, []byte{lsb, msb}); err != nil {
-			return buff.Bytes(), err
-		}
-		//  Meta
-		// All meta-events start with FF followed by the command (xx), the length,
-		// or number of bytes that will contain data (nn), and the actual data (dd).
-		// meta_event = 0xFF + <meta_type> + <v_length> + <event_data_bytes>
-	case 0xF:
-		if err := binary.Write(buff, binary.BigEndian, e.Cmd); err != nil {
-			return buff.Bytes(), err
-		}
-		switch e.Cmd {
-		// Copyright Notice
-		case 0x02:
-			copyright := []byte(e.Copyright)
-			if err := binary.Write(buff, binary.BigEndian, EncodeVarint(uint32(len(copyright)))); err != nil {
-				return buff.Bytes(), err
-			}
-			if err := binary.Write(buff, binary.BigEndian, copyright); err != nil {
-				return buff.Bytes(), err
-			}
-		// track name
-		case 0x03:
-			name := []byte(e.SeqTrackName)
-			if err := binary.Write(buff, binary.BigEndian, EncodeVarint(uint32(len(name)))); err != nil {
-				return buff.Bytes(), err
-			}
-			if err := binary.Write(buff, binary.BigEndian, name); err != nil {
-				return buff.Bytes(), err
-			}
-		// BPM / tempo event
-		case 0x51:
-			if err := binary.Write(buff, binary.BigEndian, EncodeVarint(3)); err != nil {
-				return buff.Bytes(), err
-			}
-			if err := binary.Write(buff, binary.BigEndian, Uint24(e.MsPerQuartNote)); err != nil {
-				return buff.Bytes(), err
-			}
-		case 0x2f: // end of track
-			if err := buff.WriteByte(0x0); err != nil {
-				return buff.Bytes(), err
-			}
-		}
+		buff.Write([]byte{
+			byte(e.AbsPitchBend & 0x7F),
+			byte((e.AbsPitchBend >> 7) & 0x7F),
+		})
 	default:
-		return buff.Bytes(), fmt.Errorf("didn't encode %#v because didn't know how to", e)
+		return nil, fmt.Errorf("didn't encode %#v because didn't know how to: %w", e, ErrUnexpectedData)
 	}
-
 	return buff.Bytes(), nil
 }
 
-// Size represents the byte size to encode the event
-func (e *Event) Size() uint32 {
-	switch e.MsgType {
-	case 0x2, 0x3, 0x4, 0x5, 0x6, 0xC, 0xD:
-		return 1
-	// Note Off, On, aftertouch, control change
-	case 0x8, 0x9, 0xA, 0xB, 0xE:
-		return 2
-	case 0xF:
-		// meta event
-		switch e.Cmd {
-		// Copyright Notice
-		case 0x02:
-			copyright := []byte(e.Copyright)
-			varintBytes := EncodeVarint(uint32(len(copyright)))
-			return uint32(len(copyright) + len(varintBytes))
-			// BPM (size + encoded in uint24)
-		// track name
-		case 0x03:
-			name := []byte(e.SeqTrackName)
-			varintBytes := EncodeVarint(uint32(len(name)))
-			return uint32(len(name) + len(varintBytes))
-		case 0x51: // tempo
-			return 4
-		case 0x2f: // end of track
-			return 1
-		default:
-			// NOT currently support, blowing up on purpose
-			log.Fatal(errors.New("can't encode this meta event, it is not supported yet"))
-		}
+func (e *Event) encodeSysEx(buff *bytes.Buffer) ([]byte, error) {
+	buff.Write([]byte{e.SysExType})
+	if err := writePayload(buff, e.RawData); err != nil {
+		return nil, err
 	}
-	return 0
+	return buff.Bytes(), nil
 }
 
-// isVoiceMsgType whether b corresponds to a voice message tyoe
-func isVoiceMsgType(b byte) bool {
-	// Channel Voice Messages are used to send musical performance information. The messages in
-	// this category are the Note On, Note Off, Polyphonic Key Pressure, Channel Pressure, Pitch
-	// Bend Change, Program Change, and the Control Change messages.
-	return 0x8 <= b && b <= 0xE
+// encodeMeta writes a meta event. When RawData is set, it is written out
+// unchanged, which preserves events the decoder doesn't interpret (unknown
+// meta types, sequencer specific data, ...). Otherwise, the payload is built
+// from the event fields.
+func (e *Event) encodeMeta(buff *bytes.Buffer) ([]byte, error) {
+	buff.Write([]byte{0xFF, e.Cmd})
+	var payload []byte
+	if e.RawData != nil {
+		payload = e.RawData
+	} else {
+		var err error
+		if payload, err = e.metaPayload(); err != nil {
+			return nil, err
+		}
+	}
+	if err := writePayload(buff, payload); err != nil {
+		return nil, err
+	}
+	return buff.Bytes(), nil
+}
+
+// metaPayload builds the payload of a meta event from its typed fields.
+func (e *Event) metaPayload() ([]byte, error) {
+	switch e.Cmd {
+	case 0x00: // Sequence Number
+		return []byte{byte(e.SeqNum >> 8), byte(e.SeqNum)}, nil
+	case 0x01:
+		return []byte(e.Text), nil
+	case 0x02:
+		return []byte(e.Copyright), nil
+	case 0x03:
+		return []byte(e.SeqTrackName), nil
+	case 0x04:
+		return []byte(e.InstrumentName), nil
+	case 0x05:
+		return []byte(e.Lyric), nil
+	case 0x06:
+		return []byte(e.Marker), nil
+	case 0x07:
+		return []byte(e.CuePoint), nil
+	case 0x20:
+		return []byte{e.Channel}, nil
+	case 0x2F: // End of Track
+		return nil, nil
+	case 0x51:
+		return Uint24(e.MsPerQuartNote), nil
+	case 0x54:
+		if e.SmpteOffset == nil {
+			return nil, fmt.Errorf("SMPTE Offset event is missing its offset: %w", ErrUnexpectedData)
+		}
+		return []byte{e.SmpteOffset.Hour, e.SmpteOffset.Min, e.SmpteOffset.Sec, e.SmpteOffset.Fr, e.SmpteOffset.SubFr}, nil
+	case 0x58:
+		if e.TimeSignature == nil {
+			return nil, fmt.Errorf("Time Signature event is missing its signature: %w", ErrUnexpectedData)
+		}
+		return []byte{
+			e.TimeSignature.Numerator,
+			e.TimeSignature.Denominator,
+			e.TimeSignature.ClocksPerTick,
+			e.TimeSignature.ThirtySecondNotesPerQuarter,
+		}, nil
+	case 0x59:
+		return []byte{byte(int8(e.Key)), byte(e.Scale)}, nil
+	}
+	return nil, fmt.Errorf("can't encode unsupported meta event cmd %#x without a payload: %w", e.Cmd, ErrUnexpectedData)
+}
+
+// writePayload writes a variable length payload: the length as a shortened
+// VLQ followed by the data bytes.
+func writePayload(buff *bytes.Buffer, payload []byte) error {
+	if err := binary.Write(buff, binary.BigEndian, EncodeVarint(uint32(len(payload)))); err != nil {
+		return err
+	}
+	_, err := buff.Write(payload)
+	return err
+}
+
+// Size represents the byte size to encode the event, delta-time excluded.
+func (e *Event) Size() uint32 {
+	if e == nil {
+		return 0
+	}
+	if e.SysExType == 0xF0 || e.SysExType == 0xF7 {
+		// status byte + length VLQ + payload
+		return 1 + uint32(len(EncodeVarint(uint32(len(e.RawData))))+len(e.RawData))
+	}
+	switch e.MsgType {
+	// Note Off, On, aftertouch, control change, pitch bend
+	case 0x8, 0x9, 0xA, 0xB, 0xE:
+		return 3
+	// Program change, channel pressure
+	case 0xC, 0xD:
+		return 2
+	case 0xF:
+		payload := e.RawData
+		if payload == nil {
+			var err error
+			if payload, err = e.metaPayload(); err != nil {
+				return 0
+			}
+		}
+		// 0xFF + cmd + length VLQ + payload
+		return 2 + uint32(len(EncodeVarint(uint32(len(payload))))+len(payload))
+	}
+	return 0
 }

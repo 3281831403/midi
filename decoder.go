@@ -3,61 +3,54 @@ package midi
 import (
 	"bufio"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 )
 
 type timeFormat int
-type nextChunkType int
 
 const (
 	MetricalTF timeFormat = iota + 1
 	TimeCodeTF
 )
 
-const (
-	eventChunk nextChunkType = iota + 1
-	trackChunk
-)
+/*
+Decoder Format documented there: http://www.music.mcgill.ca/~ich/classes/mumt306/midiformat.pdf
 
-/*Decoder Format documented there: http://www.music.mcgill.ca/~ich/classes/mumt306/midiformat.pdf
-  <Header Chunk> = <chunk type><length><format><ntrks><division>
+	  <Header Chunk> = <chunk type><length><format><ntrks><division>
 
 
-				Division, specifies the meaning of the delta-times.
-				It has two formats, one for metrical time, and one for time-code-based
-				time:
-				 +---+-----------------------------------------+
-				 | 0 | ticks per quarter-note                  |
-				 ==============================================|
-				 | 1 | negative SMPTE format  | ticks per frame|
-				 +---+-----------------------+-----------------+
-				 |15 |14                    8 |7             0 |
-				If bit 15 of <division> is zero, the bits 14 thru 0 represent the number
-				of delta time "ticks" which make up a quarter-note. For instance, if
-				division is 96, then a time interval of an eighth-note between two
-				events in the file would be 48.
-		    If bit 15 of <division> is a one, delta times in a file correspond
-		    to subdivisions of a second, in a way consistent with SMPTE and MIDI
-		    Time Code. Bits 14 thru 8 contain one of the four values -24, -25, -29,
-		    or -30, corresponding to the four standard SMPTE and MIDI Time Code
-		    formats (-29 corresponds to 30 drop frome), and represents the
-		    number of frames per second. These negative numbers are stored in
-		    two's compliment form. The second byte (stored positive) is the
-		    resolution within a frame: typical values may be 4 (MIDI Time Code
-		    resolution), 8, 10, 80 (bit resolution), or 100. This stream allows
-		    exact specifications of time-code-based tracks, but also allows
-		    milisecond-based tracks by specifying 25|frames/sec and a
-		    resolution of 40 units per frame. If the events in a file are stored
-		    with a bit resolution of thirty-framel time code, the division word
-		    would be E250 hex.
-
+					Division, specifies the meaning of the delta-times.
+					It has two formats, one for metrical time, and one for time-code-based
+					time:
+					 +---+-----------------------------------------+
+					 | 0 | ticks per quarter-note                  |
+					 ==============================================|
+					 | 1 | negative SMPTE format  | ticks per frame|
+					 +---+-----------------------+-----------------+
+					 |15 |14                    8 |7             0 |
+					If bit 15 of <division> is zero, the bits 14 thru 0 represent the number
+					of delta time "ticks" which make up a quarter-note. For instance, if
+					division is 96, then a time interval of an eighth-note between two
+					events in the file would be 48.
+			    If bit 15 of <division> is a one, delta times in a file correspond
+			    to subdivisions of a second, in a way consistent with SMPTE and MIDI
+			    Time Code. Bits 14 thru 8 contain one of the four values -24, -25, -29,
+			    or -30, corresponding to the four standard SMPTE and MIDI Time Code
+			    formats (-29 corresponds to 30 drop frome), and represents the
+			    number of frames per second. These negative numbers are stored in
+			    two's compliment form. The second byte (stored positive) is the
+			    resolution within a frame: typical values may be 4 (MIDI Time Code
+			    resolution), 8, 10, 80 (bit resolution), or 100. This stream allows
+			    exact specifications of time-code-based tracks, but also allows
+			    milisecond-based tracks by specifying 25|frames/sec and a
+			    resolution of 40 units per frame. If the events in a file are stored
+			    with a bit resolution of thirty-framel time code, the division word
+			    would be E250 hex.
 */
 type Decoder struct {
-	r         *bufio.Reader
-	lastEvent *Event
-	Debug     bool
+	r     *bufio.Reader
+	Debug bool
 
 	Ch chan *Track
 	/*
@@ -87,7 +80,13 @@ type Decoder struct {
 	// NumTracks represents the number of tracks in the midi file
 	NumTracks uint16
 
+	// TicksPerQuarterNote is the metrical resolution. It is zero for
+	// time-code based files, use Division for those.
 	TicksPerQuarterNote uint16
+
+	// Division is the raw division word from the header. It keeps the SMPTE
+	// time-base (the high bit set) intact so it can be written back unchanged.
+	Division uint16
 
 	TimeFormat timeFormat
 	Tracks     []*Track
@@ -108,36 +107,38 @@ func (d *Decoder) Parse() error {
 
 // Decode decodes the MIDI file into a structure available from the decoder.
 func (d *Decoder) Decode() error {
-	var err error
 	var code [4]byte
-	var division uint16
-
-	if err = binary.Read(d.r, binary.BigEndian, &code); err != nil {
+	if _, err := io.ReadFull(d.r, code[:]); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return fmt.Errorf("header chunk missing: %w", ErrTruncatedData)
+		}
 		return err
 	}
 	if code != headerChunkID {
-		return fmt.Errorf("%s - %v", ErrFmtNotSupported, code)
+		return fmt.Errorf("%v: %w", code, ErrFmtNotSupported)
 	}
 	var headerSize uint32
-	if err = binary.Read(d.r, binary.BigEndian, &headerSize); err != nil {
+	if err := binary.Read(d.r, binary.BigEndian, &headerSize); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return fmt.Errorf("header chunk truncated: %w", ErrTruncatedData)
+		}
 		return err
 	}
-
 	if headerSize != 6 {
-		return fmt.Errorf("%s - expected header size to be 6, was %d", ErrFmtNotSupported, headerSize)
+		return fmt.Errorf("expected header size to be 6, was %d: %w", headerSize, ErrFmtNotSupported)
 	}
 
-	if err = binary.Read(d.r, binary.BigEndian, &d.Format); err != nil {
+	var header [6]byte
+	if _, err := io.ReadFull(d.r, header[:]); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return fmt.Errorf("header chunk truncated: %w", ErrTruncatedData)
+		}
 		return err
 	}
-
-	if err = binary.Read(d.r, binary.BigEndian, &d.NumTracks); err != nil {
-		return err
-	}
-
-	if err = binary.Read(d.r, binary.BigEndian, &division); err != nil {
-		return err
-	}
+	d.Format = binary.BigEndian.Uint16(header[0:2])
+	d.NumTracks = binary.BigEndian.Uint16(header[2:4])
+	division := binary.BigEndian.Uint16(header[4:6])
+	d.Division = division
 
 	// If bit 15 of <division> is zero, the bits 14 thru 0 represent the number
 	// of delta time "ticks" which make up a quarter-note. For instance, if
@@ -166,45 +167,46 @@ func (d *Decoder) Decode() error {
 		d.TimeFormat = TimeCodeTF
 	}
 
-	_, nextChunk, err := d.parseTrack()
-	if err != nil {
-		return err
-	}
-
-	for err != io.EOF {
-		switch nextChunk {
-		case eventChunk:
-			nextChunk, err = d.parseEvent()
-		case trackChunk:
-			_, nextChunk, err = d.parseTrack()
+	for {
+		id, size, err := d.IDnSize()
+		if err == io.EOF {
+			break
 		}
-
-		if err != nil && err != io.EOF {
+		if err == io.ErrUnexpectedEOF {
+			return fmt.Errorf("chunk header truncated: %w", ErrTruncatedData)
+		}
+		if err != nil {
 			return err
 		}
+		if id == trackChunkID {
+			body := make([]byte, size)
+			if _, err := io.ReadFull(d.r, body); err != nil {
+				return fmt.Errorf("track chunk truncated, expected %d bytes: %w", size, ErrTruncatedData)
+			}
+			if err := d.parseTrackBody(body); err != nil {
+				return fmt.Errorf("track %d: %w", len(d.Tracks), err)
+			}
+			continue
+		}
+		// Unknown chunk types are skipped, as allowed by the SMF spec.
+		if size > 0 {
+			if _, err := io.CopyN(io.Discard, d.r, int64(size)); err != nil {
+				return fmt.Errorf("chunk %s truncated, expected %d bytes: %w", id, size, ErrTruncatedData)
+			}
+		}
 	}
 
-	// All done
+	if uint16(len(d.Tracks)) != d.NumTracks {
+		return fmt.Errorf("header declares %d track(s) but the file contains %d: %w", d.NumTracks, len(d.Tracks), ErrTruncatedData)
+	}
 	return nil
-}
-
-func (d *Decoder) parseTrack() (uint32, nextChunkType, error) {
-	id, size, err := d.IDnSize()
-	if err != nil {
-		return 0, trackChunk, err
-	}
-	if id != trackChunkID {
-		return 0, trackChunk, fmt.Errorf("%s - expected track chunk ID %v, got %v", ErrUnexpectedData, trackChunkID, id)
-	}
-	d.Tracks = append(d.Tracks, &Track{Size: size})
-	return size, eventChunk, nil
 }
 
 // IDnSize returns the next ID + block size
 func (d *Decoder) IDnSize() ([4]byte, uint32, error) {
 	var ID [4]byte
 	var blockSize uint32
-	if err := binary.Read(d.r, binary.BigEndian, &ID); err != nil {
+	if _, err := io.ReadFull(d.r, ID[:]); err != nil {
 		return ID, blockSize, err
 	}
 	if err := binary.Read(d.r, binary.BigEndian, &blockSize); err != nil {
@@ -215,22 +217,25 @@ func (d *Decoder) IDnSize() ([4]byte, uint32, error) {
 
 // VarLen returns the variable length value at the exact parser location.
 func (d *Decoder) VarLen() (val uint32, readBytes uint32, err error) {
-	buf := []byte{}
-	var lastByte bool
-	var n uint32
-
-	for !lastByte {
+	var buf []byte
+	for {
+		if len(buf) >= 4 {
+			return 0, uint32(len(buf)), ErrVarintTooLong
+		}
 		b, err := d.ReadByte()
 		if err != nil {
-			return 0, n, err
+			if err == io.EOF {
+				return 0, uint32(len(buf)), ErrVarintTruncated
+			}
+			return 0, uint32(len(buf)), err
 		}
 		buf = append(buf, b)
-		lastByte = (b>>7 == 0x0)
-		n++
+		if b&0x80 == 0 {
+			break
+		}
 	}
-
-	val, _ = DecodeVarint(buf)
-	return val, n, nil
+	val, _, err = decodeVarint(buf)
+	return val, uint32(len(buf)), err
 }
 
 // VarLenTxt Returns a variable length text string as well as the amount of
@@ -244,14 +249,14 @@ func (d *Decoder) VarLenTxt() (string, uint32, error) {
 		return "", n, err
 	}
 	buf := make([]byte, l)
-	m, err := d.r.Read(buf)
+	m, err := io.ReadFull(d.r, buf)
 	if err != nil {
-		return string(buf), n + uint32(m), err
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return "", n + uint32(m), fmt.Errorf("variable length data truncated, expected %d bytes: %w", l, ErrTruncatedData)
+		}
+		return "", n + uint32(m), err
 	}
-	if uint32(m) != l {
-		err = errors.New("couldn't read full var length text")
-	}
-	return string(buf), n + uint32(m), err
+	return string(buf), n + uint32(m), nil
 }
 
 // ReadByte returns one byte from the decoder
@@ -272,6 +277,9 @@ func (d *Decoder) Uint7() (uint8, error) {
 	b, err := d.ReadByte()
 	if err != nil {
 		return 0, err
+	}
+	if b&0x80 != 0 {
+		return 0, fmt.Errorf("expected a 7 bit data byte, got %#x: %w", b, ErrUnexpectedData)
 	}
 	return (b & 0x7f), nil
 }

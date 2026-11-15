@@ -2,6 +2,7 @@ package midi
 
 import (
 	"bytes"
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -9,11 +10,11 @@ import (
 // Track
 // <Track Chunk> = <chunk type><length><MTrk event>
 // <MTrk event> = <delta-time><event>
-//
 type Track struct {
 	Size         uint32
 	Events       []*Event
 	_name        string
+	_nameSet     bool
 	ticksPerBeat uint16
 	currentTicks uint64
 }
@@ -64,6 +65,7 @@ func (t *Track) SetName(name string) *Track {
 		return t
 	}
 	t._name = name
+	t._nameSet = true
 	return t
 }
 
@@ -72,7 +74,7 @@ func (t *Track) Name() string {
 	if t == nil {
 		return ""
 	}
-	if t._name != "" {
+	if t._nameSet {
 		return t._name
 	}
 	nameEvType := MetaByteMap["Sequence/Track name"]
@@ -89,24 +91,50 @@ func (t *Track) Name() string {
 // ChunkData converts the track and its events into a binary byte slice (chunk
 // header included). If endTrack is set to true, the end track metadata will be
 // added if not already present.
+//
+// The events are written in the order they are stored: no time signature, no
+// name and no end-of-track event is injected into the list. A name set through
+// SetName is only emitted when the track doesn't already carry a name event.
+// Events are encoded with complete status bytes, so running status is never
+// used on the way out.
 func (t *Track) ChunkData(endTrack bool) ([]byte, error) {
-	buff := bytes.NewBuffer(nil)
-	// time signature
-	// TODO: don't have 4/4 36, 8 hardcoded
-	buff.Write([]byte{0x00, 0xFF, 0x58, 0x04, 0x04, 0x02, 0x24, 0x08})
-	// name event if name set
-	if name := t.Name(); len(name) > 0 {
-		t.Events = append([]*Event{TrackName(name)}, t.Events...)
+	if t == nil {
+		return nil, nil
 	}
-
-	if endTrack {
-		if l := len(t.Events); l > 0 {
-			if t.Events[l-1].Cmd != MetaByteMap["End of Track"] {
-				t.Add(0, EndOfTrack())
+	buff := bytes.NewBuffer(nil)
+	events := t.Events
+	// A name set through SetName is encoded as a track name event unless one is
+	// already present.
+	if t._nameSet {
+		hasName := false
+		for _, e := range events {
+			if e != nil && e.MsgType == EventByteMap["Meta"] && e.Cmd == MetaByteMap["Sequence/Track name"] {
+				hasName = true
+				break
 			}
 		}
+		if !hasName {
+			events = append([]*Event{TrackName(t._name)}, events...)
+		}
 	}
-	for _, e := range t.Events {
+	if endTrack {
+		// Only add an end-of-track event when the track doesn't have one
+		// already, wherever it is.
+		hasEnd := false
+		for _, e := range events {
+			if e != nil && e.MsgType == EventByteMap["Meta"] && e.Cmd == MetaByteMap["End of Track"] {
+				hasEnd = true
+				break
+			}
+		}
+		if !hasEnd {
+			events = append(events, EndOfTrack())
+		}
+	}
+	for _, e := range events {
+		if e == nil {
+			return nil, fmt.Errorf("nil event in track: %w", ErrUnexpectedData)
+		}
 		data, err := e.Encode()
 		if err != nil {
 			return nil, err
